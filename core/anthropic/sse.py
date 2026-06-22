@@ -47,6 +47,15 @@ def format_sse_event(event_type: str, data: dict) -> str:
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def ping_event() -> str:
+    """Anthropic-style keep-alive ``ping`` SSE frame.
+
+    Emitted during upstream silence so a slow-first-token turn never leaves the
+    client idle long enough to abort with "operation timed out".
+    """
+    return format_sse_event("ping", {"type": "ping"})
+
+
 @dataclass
 class ToolCallState:
     """State for a single streaming tool call."""

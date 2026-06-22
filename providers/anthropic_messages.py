@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import inspect
+import time
 from collections.abc import AsyncIterator, Iterator
 from typing import Any, Literal
 
@@ -15,6 +18,7 @@ from config.constants import (
 )
 from core.anthropic import iter_provider_stream_error_sse_events
 from core.anthropic.emitted_sse_tracker import EmittedNativeSseTracker
+from core.anthropic.sse import ping_event
 from core.anthropic.native_messages_request import (
     build_base_native_anthropic_request_body,
 )
@@ -42,6 +46,15 @@ from providers.model_listing import (
 from providers.rate_limit import GlobalRateLimiter
 
 StreamChunkMode = Literal["line", "event"]
+
+# Keep-alive heartbeat (seconds of upstream silence) before emitting a ``ping``
+# so a slow-first-token turn (huge context + thinking / long prefill) never
+# leaves the client idle long enough to abort with "operation timed out".
+_KEEPALIVE_INTERVAL_S = 5.0
+# Max seconds to buffer leading events for empty-completion detection before
+# committing to the stream with keep-alive. Transient empty completions resolve
+# well under this; legitimately-thinking turns exceed it and get keep-alive.
+_KEEPALIVE_GRACE_S = 5.0
 
 
 async def _maybe_await_aclose(response: Any) -> None:
@@ -423,53 +436,138 @@ class AnthropicMessagesTransport(BaseProvider):
                 # When the orchestration layer can retry the turn
                 # (``raise_on_prestream_error``), hold back the leading
                 # non-content events (message_start / ping) until the first
-                # content block arrives. If the upstream completes a 200 stream
-                # WITHOUT ever opening a content block — DeepSeek's intermittent
-                # "empty completion" — nothing has been yielded to the client
-                # yet, so we raise :class:`PreStreamProviderError` for a clean
-                # retry instead of relaying a content-less body the client
-                # rejects as "empty or malformed response (HTTP 200)".
+                # content block arrives, so an intermittent "empty completion"
+                # (HTTP 200 that never opens a content block) is retried cleanly
+                # via :class:`PreStreamProviderError` instead of relaying a
+                # content-less body the client rejects.
+                #
+                # Buffering must NOT starve the client of keep-alive: on a
+                # huge-context + thinking turn the first content block can be many
+                # seconds away (long prefill), and with nothing on the wire the
+                # *client* aborts with "operation timed out". So buffering is
+                # bounded by ``_KEEPALIVE_GRACE_S`` plus an idle heartbeat: once
+                # exceeded we flush the buffered header and emit ``ping`` frames,
+                # committing to the stream (no further clean pre-stream retry).
                 guard_empty = raise_on_prestream_error
                 lead_buffer: list[str] = []
                 content_started = not guard_empty
+                header_flushed = False
+                buffer_started_at: float | None = None
 
-                # Hold each ``tool_use`` block until it is complete: a truncated
-                # tool call (DeepSeek dropping the socket mid ``Edit``/``Write``)
-                # never reaches the client. If the upstream ends with a tool_use
-                # still open, ``buffer_incomplete_tool_use`` raises
-                # ``IncompleteUpstreamStreamError`` — handled like any mid-stream
-                # transport failure below (clean retry or error tail), so the
-                # partial tool call is dropped rather than relayed.
-                async for chunk in buffer_incomplete_tool_use(
+                # Hold each ``tool_use`` block until it is complete (truncated
+                # tool calls never reach the client) and drain the upstream
+                # through a queue so an idle timer can inject keep-alive ``ping``
+                # frames during upstream silence WITHOUT cancelling an in-flight
+                # socket read (cancelling ``queue.get`` is safe; cancelling a
+                # socket read is not).
+                upstream = buffer_incomplete_tool_use(
                     self._iter_stream_chunks(
                         response,
                         state=state,
                         thinking_enabled=thinking_enabled,
                     )
-                ):
-                    emitted_tracker.feed(chunk)
-                    if not content_started:
-                        lead_buffer.append(chunk)
-                        if emitted_tracker.saw_content_block_start:
-                            content_started = True
-                            for buffered in lead_buffer:
-                                chunk_count += 1
-                                chunk_bytes += len(
-                                    buffered.encode("utf-8", errors="replace")
-                                )
-                                sent_any_event = True
-                                yield buffered
-                            lead_buffer.clear()
-                        continue
-                    chunk_count += 1
-                    chunk_bytes += len(chunk.encode("utf-8", errors="replace"))
-                    sent_any_event = True
-                    yield chunk
+                )
+                pump_queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(
+                    maxsize=512
+                )
+
+                async def _pump() -> None:
+                    try:
+                        async for chunk in upstream:
+                            await pump_queue.put(("chunk", chunk))
+                    except Exception as exc:  # re-raised in the consumer below
+                        await pump_queue.put(("error", exc))
+                    else:
+                        await pump_queue.put(("done", None))
+
+                pump_task = asyncio.ensure_future(_pump())
+                try:
+                    while True:
+                        try:
+                            kind, payload = await asyncio.wait_for(
+                                pump_queue.get(), timeout=_KEEPALIVE_INTERVAL_S
+                            )
+                        except asyncio.TimeoutError:
+                            # Upstream idle for the heartbeat interval.
+                            if sent_any_event:
+                                # Header already on the wire → ping is a
+                                # contract-valid keep-alive.
+                                yield ping_event()
+                            elif guard_empty and not content_started and lead_buffer:
+                                # Pre-content buffering with a buffered header:
+                                # flush header + pings, commit to keep-alive.
+                                content_started = True
+                                header_flushed = True
+                                guard_empty = False
+                                for buffered in lead_buffer:
+                                    chunk_count += 1
+                                    chunk_bytes += len(
+                                        buffered.encode("utf-8", errors="replace")
+                                    )
+                                    sent_any_event = True
+                                    yield buffered
+                                lead_buffer.clear()
+                                yield ping_event()
+                            # else: no message_start observed yet → cannot ping
+                            # before it; keep waiting (httpx read timeout bounds
+                            # the absolute silence).
+                            continue
+
+                        if kind == "error":
+                            raise payload
+                        if kind == "done":
+                            break
+
+                        chunk = payload
+                        emitted_tracker.feed(chunk)
+                        if not content_started:
+                            if buffer_started_at is None:
+                                buffer_started_at = time.monotonic()
+                            lead_buffer.append(chunk)
+                            if emitted_tracker.saw_content_block_start:
+                                content_started = True
+                                for buffered in lead_buffer:
+                                    chunk_count += 1
+                                    chunk_bytes += len(
+                                        buffered.encode("utf-8", errors="replace")
+                                    )
+                                    sent_any_event = True
+                                    yield buffered
+                                lead_buffer.clear()
+                            elif (
+                                time.monotonic() - buffer_started_at
+                                >= _KEEPALIVE_GRACE_S
+                            ):
+                                # Buffered too long without content (upstream
+                                # pinging or slow thinking): flush header + pings
+                                # and commit to keep-alive passthrough.
+                                content_started = True
+                                header_flushed = True
+                                guard_empty = False
+                                for buffered in lead_buffer:
+                                    chunk_count += 1
+                                    chunk_bytes += len(
+                                        buffered.encode("utf-8", errors="replace")
+                                    )
+                                    sent_any_event = True
+                                    yield buffered
+                                lead_buffer.clear()
+                                yield ping_event()
+                            continue
+                        chunk_count += 1
+                        chunk_bytes += len(chunk.encode("utf-8", errors="replace"))
+                        sent_any_event = True
+                        yield chunk
+                finally:
+                    if not pump_task.done():
+                        pump_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await pump_task
 
                 if guard_empty and not content_started:
-                    # Buffered the whole upstream stream; it never opened a
-                    # content block. Nothing was yielded to the client, so the
-                    # turn can be retried cleanly on the orchestration layer.
+                    # Buffered the whole upstream within the keep-alive grace and
+                    # it never opened a content block. Nothing was yielded to the
+                    # client, so the turn can be retried cleanly.
                     trace_event(
                         stage="provider",
                         event="provider.response.empty_completion",
@@ -483,18 +581,19 @@ class AnthropicMessagesTransport(BaseProvider):
                         self._empty_completion_message(request_id)
                     )
 
-                if (
-                    emitted_tracker.saw_content_block_start
-                    and not emitted_tracker.saw_message_stop
+                header_only_empty = (
+                    header_flushed and not emitted_tracker.saw_content_block_start
+                )
+                if not emitted_tracker.saw_message_stop and (
+                    emitted_tracker.saw_content_block_start or header_only_empty
                 ):
-                    # Upstream opened content but closed the stream WITHOUT a
-                    # terminal message_stop (e.g. DeepSeek dropping the socket
-                    # mid-message, no exception raised). Repair into a well-formed
-                    # stream so the client SDK does not abort the turn with
-                    # "stream closed before completion". An open block means the
-                    # content itself was truncated → honest error tail; all blocks
-                    # closed means only the terminator was lost → clean close with
-                    # no spurious error text.
+                    # Upstream ended without a terminal message_stop. Either it
+                    # opened content and was cut short, or we flushed a header +
+                    # keep-alive pre-content and upstream then produced nothing.
+                    # (A passthrough stream that only emitted message_start and
+                    # nothing else is relayed as-is, matching prior behavior.)
+                    # Repair into a well-formed stream so the client SDK does not
+                    # abort with "stream closed before completion".
                     had_open = emitted_tracker.has_open_blocks
                     trace_event(
                         stage="provider",
@@ -504,12 +603,20 @@ class AnthropicMessagesTransport(BaseProvider):
                         gateway_model=request.model,
                         downstream_model=body.get("model"),
                         had_open_blocks=had_open,
+                        header_only_empty=header_only_empty,
                     )
                     for event in emitted_tracker.iter_close_unclosed_blocks():
                         yield event
-                    if had_open:
+                    if had_open or header_only_empty:
+                        # Truncated content, or keep-alive committed but upstream
+                        # produced nothing: honest error tail (clear retry signal).
+                        tail_message = (
+                            self._empty_completion_message(request_id)
+                            if header_only_empty
+                            else self._incomplete_stream_message(request_id)
+                        )
                         for event in emitted_tracker.iter_midstream_error_tail(
-                            self._incomplete_stream_message(request_id),
+                            tail_message,
                             request=request,
                             input_tokens=input_tokens,
                             log_raw_sse_events=self._config.log_raw_sse_events,

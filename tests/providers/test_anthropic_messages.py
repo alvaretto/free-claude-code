@@ -1,5 +1,6 @@
 """Tests for the shared native Anthropic Messages transport."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -701,5 +702,117 @@ async def test_clean_end_only_missing_message_stop_closes_cleanly(provider_confi
     starts = [e for e in parsed if e.event == "content_block_start"]
     assert len(starts) == 1  # no spurious error block added
     assert sum(1 for e in parsed if e.event == "message_delta") == 1  # no duplicate
+    assert parsed[-1].event == "message_stop"
+    assert_anthropic_stream_contract(parsed)
+
+
+# --- Keep-alive heartbeat during long prefill / thinking -------------------
+
+
+class _SlowFakeResponse(FakeResponse):
+    """Upstream that stalls after a marker line to simulate a long prefill /
+    thinking window (huge-context turn) before opening a content block."""
+
+    def __init__(self, *, lines, stall_after_index, stall_seconds):
+        super().__init__(lines=lines)
+        self._stall_after_index = stall_after_index
+        self._stall_seconds = stall_seconds
+
+    async def aiter_lines(self):
+        for i, line in enumerate(self._lines):
+            yield line
+            if i == self._stall_after_index:
+                await asyncio.sleep(self._stall_seconds)
+
+
+@pytest.mark.asyncio
+async def test_keepalive_ping_during_long_prefill_then_streams(provider_config):
+    """Regression guard for the "operation timed out" failure mode.
+
+    With the empty-completion guard ON, a turn whose first content block is far
+    away (huge-context prefill / extended thinking) must NOT leave the client
+    idle: once buffering exceeds the keep-alive grace, the transport flushes the
+    buffered header and emits ``ping`` frames, then relays the real content when
+    it finally arrives.
+    """
+    provider = NativeProvider(provider_config)
+    req = MockRequest()
+    msg_start = format_sse_event(
+        "message_start",
+        {
+            "type": "message_start",
+            "message": {
+                "id": "msg_slow",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "test-model",
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 5, "output_tokens": 1},
+            },
+        },
+    )
+    block_start = format_sse_event(
+        "content_block_start",
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        },
+    )
+    block_delta = format_sse_event(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "Listo"},
+        },
+    )
+    block_stop = format_sse_event(
+        "content_block_stop", {"type": "content_block_stop", "index": 0}
+    )
+    msg_delta = format_sse_event(
+        "message_delta",
+        {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+    )
+    msg_stop = format_sse_event("message_stop", {"type": "message_stop"})
+
+    header_lines = msg_start.splitlines()
+    rest_lines: list[str] = []
+    for blob_text in (block_start, block_delta, block_stop, msg_delta, msg_stop):
+        rest_lines.extend(blob_text.splitlines())
+    lines = header_lines + rest_lines
+    # Stall right after the header frame's terminating blank line.
+    response = _SlowFakeResponse(
+        lines=lines,
+        stall_after_index=len(header_lines) - 1,
+        stall_seconds=0.15,
+    )
+
+    with (
+        patch("providers.anthropic_messages._KEEPALIVE_INTERVAL_S", 0.02),
+        patch("providers.anthropic_messages._KEEPALIVE_GRACE_S", 0.02),
+        patch.object(provider._client, "build_request", return_value=MagicMock()),
+        patch.object(
+            provider._client, "send", new_callable=AsyncMock, return_value=response
+        ),
+    ):
+        events = [
+            e
+            async for e in provider.stream_response(
+                req, request_id="REQ_SLOW", raise_on_prestream_error=True
+            )
+        ]
+
+    blob = "".join(events)
+    # A keep-alive ping was emitted during the stall...
+    assert "event: ping" in blob
+    # ...after the header was flushed, and before the real content arrived.
+    assert blob.index("message_start") < blob.index("event: ping")
+    assert blob.index("event: ping") < blob.index("content_block_start")
+    # The real content still streamed and the message terminated cleanly.
+    assert "Listo" in blob
+    parsed = parse_sse_text(blob)
     assert parsed[-1].event == "message_stop"
     assert_anthropic_stream_contract(parsed)
