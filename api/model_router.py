@@ -223,6 +223,14 @@ class ModelRouter:
             thinking_enabled=vision_thinking,
         )
 
+    def _has_vision_content(self, request: MessagesRequest) -> bool:
+        """Whether the request carries image/document blocks (vision content)."""
+        raw_messages = [
+            msg.model_dump() if hasattr(msg, "model_dump") else msg
+            for msg in request.messages
+        ]
+        return has_vision_content(raw_messages)
+
     def resolve_messages_request(
         self, request: MessagesRequest
     ) -> RoutedMessagesRequest:
@@ -236,9 +244,14 @@ class ModelRouter:
 
         # Vision routing has its own dedicated target with a dedicated fallback
         # (VISION_MODEL_FALLBACK); it does not use the tier MODEL_*_FALLBACK chain.
+        # Detect the vision route by ACTUAL vision content (mirroring
+        # resolve_vision_aware), NOT by ref equality: when VISION_MODEL coincides
+        # with a tier model (e.g. VISION_MODEL == MODEL_HAIKU == sakana/fugu), the
+        # ref-equality proxy misclassifies every non-vision request of that tier as
+        # a vision route, bypassing the tier MODEL_*_FALLBACK chain.
         is_vision_route = (
             self._settings.model_vision is not None
-            and resolved.provider_model_ref == self._settings.model_vision
+            and self._has_vision_content(request)
         )
         fallback_resolved = (
             self._resolve_vision_fallback(resolved)

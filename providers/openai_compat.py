@@ -29,6 +29,7 @@ from providers.error_mapping import (
     map_error,
     user_visible_message_for_mapped_provider_error,
 )
+from providers.exceptions import PreStreamProviderError
 from providers.model_listing import extract_openai_model_ids
 from providers.rate_limit import GlobalRateLimiter
 
@@ -329,14 +330,21 @@ class OpenAIChatTransport(BaseProvider):
     ) -> AsyncIterator[str]:
         """Stream response in Anthropic SSE format.
 
-        ``raise_on_prestream_error`` is accepted for interface parity but has no
-        effect here: this transport emits ``message_start`` before sending the
-        upstream request, so there is no pre-stream window in which to fail over.
+        When ``raise_on_prestream_error`` is set, a failure that occurs before any
+        client-visible event reaches the wire (the upstream stream never opens —
+        exhausted 429/5xx, connect/read timeout) is raised as
+        :class:`PreStreamProviderError` so the orchestration layer can fail over to
+        the tier fallback model. To keep that window clean, ``message_start`` is
+        deferred until the upstream stream opens. Legacy callers (flag unset) keep
+        the eager ``message_start`` and the in-stream error envelope, byte-for-byte.
         """
-        _ = raise_on_prestream_error
         with logger.contextualize(request_id=request_id):
             async for event in self._stream_response_impl(
-                request, input_tokens, request_id, thinking_enabled=thinking_enabled
+                request,
+                input_tokens,
+                request_id,
+                thinking_enabled=thinking_enabled,
+                raise_on_prestream_error=raise_on_prestream_error,
             ):
                 yield event
 
@@ -347,6 +355,7 @@ class OpenAIChatTransport(BaseProvider):
         request_id: str | None,
         *,
         thinking_enabled: bool | None,
+        raise_on_prestream_error: bool = False,
     ) -> AsyncIterator[str]:
         """Shared streaming implementation."""
         tag = self._provider_name
@@ -373,7 +382,16 @@ class OpenAIChatTransport(BaseProvider):
             body=provider_chat_body_snapshot(body),
         )
 
-        yield sse.message_start()
+        # ``message_start`` is the first client-visible event. In failover mode
+        # (``raise_on_prestream_error``) DEFER it until the upstream stream opens,
+        # so a pre-stream failure (exhausted 429/5xx, connect/read timeout) can be
+        # raised as ``PreStreamProviderError`` — nothing emitted yet — letting the
+        # orchestration layer retry on the tier fallback model. Legacy callers keep
+        # the eager emit, byte-for-byte.
+        message_started = False
+        if not raise_on_prestream_error:
+            yield sse.message_start()
+            message_started = True
 
         think_parser = ThinkTagParser()
         heuristic_parser = HeuristicToolParser()
@@ -385,6 +403,9 @@ class OpenAIChatTransport(BaseProvider):
         async with self._global_rate_limiter.concurrency_slot():
             try:
                 stream, body = await self._create_stream(body)
+                if not message_started:
+                    yield sse.message_start()
+                    message_started = True
                 tool_argument_aliases = self._tool_argument_aliases(body)
                 async for chunk in stream:
                     if getattr(chunk, "usage", None):
@@ -474,6 +495,21 @@ class OpenAIChatTransport(BaseProvider):
                     read_timeout_s=self._config.http_read_timeout,
                 )
                 error_message = append_request_id(base_message, request_id)
+                if raise_on_prestream_error and not message_started:
+                    # Pre-stream failure with nothing emitted to the client yet:
+                    # let the orchestration layer (_stream_with_failover) retry the
+                    # turn on the tier fallback model instead of surfacing an
+                    # in-stream error envelope here.
+                    trace_event(
+                        stage="provider",
+                        event="provider.response.error",
+                        source="provider",
+                        provider=tag,
+                        error_message=error_message,
+                        mapped_error_type=type(mapped_e).__name__,
+                        mid_stream=False,
+                    )
+                    raise PreStreamProviderError(error_message) from e
                 trace_event(
                     stage="provider",
                     event="provider.response.error",
