@@ -158,6 +158,46 @@ def _assert_no_forbidden_assistant_block(block: Any) -> None:
         )
 
 
+def _anthropic_image_block_to_openai_part(block: Any) -> dict[str, Any]:
+    """Convert an Anthropic ``image`` block to an OpenAI ``image_url`` content part.
+
+    Supports ``base64`` sources (re-emitted as a ``data:`` URL) and ``url`` sources,
+    so vision-capable OpenAI-compatible providers (e.g. Sakana Fugu) can receive
+    images routed via ``VISION_MODEL``.
+    """
+    source = get_block_attr(block, "source", None)
+    if source is None:
+        raise OpenAIConversionError("User image block is missing its 'source'.")
+    source_type = get_block_attr(source, "type", "")
+    if source_type == "base64":
+        media_type = get_block_attr(source, "media_type", "") or "image/png"
+        data = get_block_attr(source, "data", "")
+        if not data:
+            raise OpenAIConversionError("Base64 image block is missing 'data'.")
+        url = f"data:{media_type};base64,{data}"
+    elif source_type == "url":
+        url = get_block_attr(source, "url", "")
+        if not url:
+            raise OpenAIConversionError("URL image block is missing 'url'.")
+    else:
+        raise OpenAIConversionError(
+            f"Unsupported image source type {source_type!r} for OpenAI chat conversion."
+        )
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _user_buf_to_content(buf: list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+    """Collapse a user text/image buffer to OpenAI message content.
+
+    Text-only buffers stay a plain string (backward-compatible with existing
+    behavior and tests); a buffer containing any image part becomes an ordered
+    list of OpenAI content parts (text + image_url) preserving block order.
+    """
+    if any(part.get("type") == "image_url" for part in buf):
+        return list(buf)
+    return "\n".join(part.get("text", "") for part in buf)
+
+
 class AnthropicToOpenAIConverter:
     """Convert Anthropic message format to OpenAI-compatible format."""
 
@@ -419,26 +459,22 @@ class AnthropicToOpenAIConverter:
             }
 
         result: list[dict[str, Any]] = []
-        text_parts: list[str] = []
+        buf: list[dict[str, Any]] = []
         cleared = False
 
-        def flush_text() -> None:
-            if text_parts:
-                result.append({"role": "user", "content": "\n".join(text_parts)})
-                text_parts.clear()
+        def flush() -> None:
+            if buf:
+                result.append({"role": "user", "content": _user_buf_to_content(buf)})
+                buf.clear()
 
         for block in content:
             block_type = get_block_type(block)
             if block_type == "text":
-                text_parts.append(get_block_attr(block, "text", ""))
+                buf.append({"type": "text", "text": get_block_attr(block, "text", "")})
             elif block_type == "image":
-                raise OpenAIConversionError(
-                    "User message image blocks are not supported for OpenAI chat "
-                    "conversion; use a vision-capable native Anthropic provider or "
-                    "extend the converter."
-                )
+                buf.append(_anthropic_image_block_to_openai_part(block))
             elif block_type == "tool_result":
-                flush_text()
+                flush()
                 tool_content = get_block_attr(block, "content", "")
                 serialized = _serialize_tool_result_content(tool_content)
                 tuid = get_block_attr(block, "tool_use_id")
@@ -463,32 +499,28 @@ class AnthropicToOpenAIConverter:
             else:
                 pass
 
-        flush_text()
+        flush()
         return {"messages": result, "cleared_pending": cleared}
 
     @staticmethod
     def _convert_user_message(content: list[Any]) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
-        text_parts: list[str] = []
+        buf: list[dict[str, Any]] = []
 
-        def flush_text() -> None:
-            if text_parts:
-                result.append({"role": "user", "content": "\n".join(text_parts)})
-                text_parts.clear()
+        def flush() -> None:
+            if buf:
+                result.append({"role": "user", "content": _user_buf_to_content(buf)})
+                buf.clear()
 
         for block in content:
             block_type = get_block_type(block)
 
             if block_type == "text":
-                text_parts.append(get_block_attr(block, "text", ""))
+                buf.append({"type": "text", "text": get_block_attr(block, "text", "")})
             elif block_type == "image":
-                raise OpenAIConversionError(
-                    "User message image blocks are not supported for OpenAI chat "
-                    "conversion; use a vision-capable native Anthropic provider or "
-                    "extend the converter."
-                )
+                buf.append(_anthropic_image_block_to_openai_part(block))
             elif block_type == "tool_result":
-                flush_text()
+                flush()
                 tool_content = get_block_attr(block, "content", "")
                 serialized = _serialize_tool_result_content(tool_content)
                 result.append(
@@ -499,7 +531,7 @@ class AnthropicToOpenAIConverter:
                     }
                 )
 
-        flush_text()
+        flush()
         return result
 
     @staticmethod

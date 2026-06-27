@@ -564,13 +564,18 @@ def test_assistant_redacted_thinking_omitted_from_openai_chat():
     assert "reasoning_content" not in result[0]
 
 
-def test_convert_user_message_image_raises():
+def test_convert_user_message_image_now_converts_to_image_url():
+    # Vision support added 2026-06-26: user image blocks convert to OpenAI
+    # ``image_url`` parts (was: raised OpenAIConversionError) so Sakana Fugu and
+    # other vision-capable OpenAI-compatible providers can receive images.
     content = [
         MockBlock(type="image", source={"type": "url", "url": "https://example.com/x"})
     ]
     messages = [MockMessage("user", content)]
-    with pytest.raises(OpenAIConversionError):
-        AnthropicToOpenAIConverter.convert_messages(messages)
+    result = AnthropicToOpenAIConverter.convert_messages(messages)
+    assert result[0]["content"] == [
+        {"type": "image_url", "image_url": {"url": "https://example.com/x"}}
+    ]
 
 
 def test_convert_assistant_text_after_tool_use_splits_for_openai_chat():
@@ -662,3 +667,56 @@ def test_convert_assistant_server_tool_blocks_raise(content) -> None:
     messages = [MockMessage("assistant", content)]
     with pytest.raises(OpenAIConversionError, match="server tool"):
         AnthropicToOpenAIConverter.convert_messages(messages)
+
+
+# --- User image block (vision) conversion: Anthropic image -> OpenAI image_url ---
+
+
+def test_convert_user_message_base64_image_becomes_image_url():
+    content = [
+        MockBlock(type="text", text="¿Qué ves?"),
+        MockBlock(
+            type="image",
+            source={"type": "base64", "media_type": "image/png", "data": "QUJD"},
+        ),
+    ]
+    result = AnthropicToOpenAIConverter.convert_messages([MockMessage("user", content)])
+    assert len(result) == 1
+    parts = result[0]["content"]
+    assert isinstance(parts, list)
+    assert parts[0] == {"type": "text", "text": "¿Qué ves?"}
+    assert parts[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,QUJD"},
+    }
+
+
+def test_convert_user_message_url_image_passthrough():
+    content = [
+        MockBlock(type="image", source={"type": "url", "url": "https://x/y.png"}),
+    ]
+    result = AnthropicToOpenAIConverter.convert_messages([MockMessage("user", content)])
+    assert result[0]["content"] == [
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}}
+    ]
+
+
+def test_convert_user_message_text_only_stays_string():
+    # Regression: text-only user content must stay a plain string (not a parts list).
+    content = [MockBlock(type="text", text="hola"), MockBlock(type="text", text="mundo")]
+    result = AnthropicToOpenAIConverter.convert_messages([MockMessage("user", content)])
+    assert result[0]["content"] == "hola\nmundo"
+
+
+def test_convert_user_message_image_missing_data_raises():
+    content = [
+        MockBlock(type="image", source={"type": "base64", "media_type": "image/png"}),
+    ]
+    with pytest.raises(OpenAIConversionError, match="missing 'data'"):
+        AnthropicToOpenAIConverter.convert_messages([MockMessage("user", content)])
+
+
+def test_convert_user_message_unknown_image_source_raises():
+    content = [MockBlock(type="image", source={"type": "bogus"})]
+    with pytest.raises(OpenAIConversionError, match="Unsupported image source"):
+        AnthropicToOpenAIConverter.convert_messages([MockMessage("user", content)])

@@ -20,6 +20,8 @@ DEEPSEEK_ANTHROPIC_DEFAULT_BASE = "https://api.deepseek.com/anthropic"
 # Historical export name: DeepSeek upstream is the native Anthropic path above.
 DEEPSEEK_DEFAULT_BASE = DEEPSEEK_ANTHROPIC_DEFAULT_BASE
 FIREWORKS_DEFAULT_BASE = "https://api.fireworks.ai/inference/v1"
+# Sakana Fugu OpenAI-compatible chat completions (NOT native Anthropic Messages).
+SAKANA_DEFAULT_BASE = "https://api.sakana.ai/v1"
 OPENROUTER_DEFAULT_BASE = "https://openrouter.ai/api/v1"
 LMSTUDIO_DEFAULT_BASE = "http://localhost:1234/v1"
 LLAMACPP_DEFAULT_BASE = "http://localhost:8080/v1"
@@ -165,6 +167,16 @@ PROVIDER_CATALOG: dict[str, ProviderDescriptor] = {
         credential_attr="fireworks_api_key",
         default_base_url=FIREWORKS_DEFAULT_BASE,
         proxy_attr="fireworks_proxy",
+        capabilities=("chat", "streaming", "tools", "thinking", "rate_limit"),
+    ),
+    "sakana": ProviderDescriptor(
+        provider_id="sakana",
+        transport_type="openai_chat",
+        credential_env="SAKANA_API_KEY",
+        credential_url="https://console.sakana.ai",
+        credential_attr="sakana_api_key",
+        default_base_url=SAKANA_DEFAULT_BASE,
+        proxy_attr="sakana_proxy",
         capabilities=("chat", "streaming", "tools", "thinking", "rate_limit"),
     ),
 }
