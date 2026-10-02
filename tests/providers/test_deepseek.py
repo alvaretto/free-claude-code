@@ -1318,11 +1318,9 @@ def test_strips_document_blocks_for_deepseek(deepseek_provider):
         request, reasoning=reasoning_for(request)
     )
 
-    assert body["messages"][0] == {
-        "role": "tool",
-        "tool_call_id": "t1",
-        "content": "PDF text extracted",
-    }
+    # The tool_result has no preceding tool_use: DeepSeek rejects a lone "tool"
+    # message (HTTP 400, verified live 2026-10-02), so it is reframed as user text.
+    assert body["messages"][0] == {"role": "user", "content": "PDF text extracted"}
 
 
 def test_preserves_user_image_and_text_order(deepseek_provider):

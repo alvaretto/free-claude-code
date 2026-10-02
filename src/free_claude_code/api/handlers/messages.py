@@ -27,6 +27,7 @@ from free_claude_code.api.response_streams import (
 from free_claude_code.application.errors import ApplicationError
 from free_claude_code.application.execution import ProviderExecutor, TokenCounter
 from free_claude_code.application.ports import ModelInfoLookup, ProviderResolver
+from free_claude_code.application.prompt_extras import apply_prompt_extras
 from free_claude_code.application.routing import (
     ModelRouter,
     RoutedMessagesRequest,
@@ -136,6 +137,7 @@ class MessagesHandler:
             require_non_empty_messages(request_data.messages)
             routed = self._model_router.resolve_messages_request(request_data)
             routed = self._apply_message_routing_policies(routed)
+            routed = apply_prompt_extras(routed, self._settings)
             record_request_route(
                 routed.resolved.primary.provider_id,
                 routed.resolved.primary.provider_model,

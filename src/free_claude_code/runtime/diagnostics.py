@@ -71,6 +71,8 @@ ROUTING_FIELDS = (
     "model_sonnet",
     "model_haiku",
     "model_fallbacks",
+    "vision_model",
+    "routing_banner",
 )
 REASONING_FIELDS = (
     "reasoning_policy",
@@ -100,6 +102,7 @@ NIM_FIELDS = (
 )
 EXCLUDED_FIELDS = {
     "proxy_auth_token",
+    "extra_system_prompt",
     "telegram_bot_token",
     "allowed_telegram_user_id",
     "discord_bot_token",

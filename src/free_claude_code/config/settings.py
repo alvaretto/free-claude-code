@@ -96,6 +96,7 @@ class Settings(BaseModel):
             "model_sonnet",
             "model_haiku",
             "model_fallbacks",
+            "vision_model",
         ):
             value = getattr(self, field)
             refs = value if isinstance(value, tuple) else (value,) if value else ()
@@ -443,6 +444,21 @@ class Settings(BaseModel):
     model_fallbacks: OptionalModelFallbacks = Field(
         default=None,
         validation_alias="MODEL_FALLBACKS",
+    )
+    # Requests carrying images go to this provider/model, whatever the tier
+    # (useful when the tier models cannot see images).
+    vision_model: OptionalNonEmptyString = Field(
+        default=None, validation_alias="VISION_MODEL"
+    )
+
+    # ==================== Prompt Extras ====================
+    # Appended to the system prompt of every converted Messages request.
+    extra_system_prompt: OptionalNonEmptyString = Field(
+        default=None, validation_alias="EXTRA_SYSTEM_PROMPT"
+    )
+    # Ask the model to open each reply with "🤖 Modelo: <id> | Thinking: <ON|OFF>".
+    routing_banner: bool = Field(
+        default=False, validation_alias="ENABLE_ROUTING_BANNER"
     )
 
     # ==================== Per-Provider Proxy ====================

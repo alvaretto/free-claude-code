@@ -22,6 +22,7 @@ from free_claude_code.core.anthropic import (
     TokenCountRequest,
 )
 from free_claude_code.core.anthropic.passthrough import NativeMessagesRequest
+from free_claude_code.core.anthropic.tool_history import has_image_content
 from free_claude_code.core.gateway_model_ids import (
     DESKTOP_MODEL_PREFIX,
     DESKTOP_NO_THINKING_PREFIX,
@@ -277,7 +278,7 @@ class ModelRouter:
         self, request: MessagesRequest
     ) -> RoutedMessagesRequest:
         """Return an internal routed request context."""
-        resolved = self.resolve(request.model)
+        resolved = self._vision_override(request, self.resolve(request.model))
         routed = request.model_copy(deep=True)
         routed.model = resolved.primary.provider_model
         return RoutedMessagesRequest(
@@ -287,6 +288,29 @@ class ModelRouter:
                 routed,
                 resolved.reasoning_preference,
             ),
+        )
+
+    def _vision_override(
+        self, request: MessagesRequest, resolved: ResolvedModelRoute
+    ) -> ResolvedModelRoute:
+        """Send image-bearing requests to ``VISION_MODEL`` when configured."""
+
+        vision_ref = self._settings.vision_model
+        if vision_ref is None or not has_image_content(request.messages):
+            return resolved
+        primary = self._target_from_ref(vision_ref)
+        if primary == resolved.primary:
+            return resolved
+        logger.info(
+            "VISION_ROUTING: image content in '{}' -> {}",
+            request.model,
+            primary.provider_model_ref,
+        )
+        return replace(
+            resolved,
+            primary=primary,
+            fallbacks=self._fallback_targets(primary),
+            reasoning_preference=ReasoningPreference.OFF,
         )
 
     def resolve_messages_request_with_policy(

@@ -8,8 +8,11 @@ from copy import deepcopy
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlsplit, urlunsplit
 
+from loguru import logger
+
 from free_claude_code.application.errors import InvalidRequestError
 from free_claude_code.core.anthropic.models import Message, MessagesRequest
+from free_claude_code.core.anthropic.tool_history import reconcile_tool_pairs
 from free_claude_code.core.diagnostics import extract_upstream_error_detail
 from free_claude_code.core.history_replay import (
     HistoryProtocol,
@@ -58,7 +61,24 @@ def normalize_messages_history(request: MessagesRequest) -> MessagesRequest:
             messages.append(Message.model_validate(body))
     except HistoryReplayError as error:
         raise InvalidRequestError(str(error)) from error
-    return request.model_copy(update={"messages": messages})
+    return request.model_copy(update={"messages": _reconcile_tool_pairs(messages)})
+
+
+def _reconcile_tool_pairs(messages: list[Message]) -> list[Message]:
+    """Repair unpaired tool_use/tool_result blocks that providers reject."""
+    dumped = [
+        message.model_dump(mode="json", exclude_none=True) for message in messages
+    ]
+    repaired, stats = reconcile_tool_pairs(dumped)
+    if not any(stats.values()):
+        return messages
+    logger.warning(
+        "HISTORY_REPAIR: reconciled orphaned tool pairs "
+        "(added_tool_results={added_tool_results} "
+        "orphan_tool_results_as_content={orphan_tool_results_as_content})",
+        **stats,
+    )
+    return [Message.model_validate(message) for message in repaired]
 
 
 def replay_origin(
