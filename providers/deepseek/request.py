@@ -33,21 +33,46 @@ _OMITTED_ATTACHMENT_TEXT = (
 )
 _OMITTED_ATTACHMENT_BLOCK = {"type": "text", "text": _OMITTED_ATTACHMENT_TEXT}
 
+# DeepSeek models whose Anthropic-compatible endpoint accepts ``image`` blocks.
+# Verified live 2026-10-02: deepseek-v4-flash reads text/shapes from PNGs;
+# deepseek-v4-pro answers "cannot see the image". Neither accepts ``document``.
+_VISION_CAPABLE_MODELS = frozenset({"deepseek-v4-flash"})
+_HOISTED_IMAGE_TEXT = "[image attached after this tool result]"
+_HOISTED_IMAGE_BLOCK = {"type": "text", "text": _HOISTED_IMAGE_TEXT}
 
-def _strip_unsupported_attachment_blocks(messages: Any) -> Any:
+
+def _model_supports_images(model: Any) -> bool:
+    """True when the DeepSeek model id accepts image input."""
+    return isinstance(model, str) and model in _VISION_CAPABLE_MODELS
+
+
+def _strip_unsupported_attachment_blocks(
+    messages: Any, *, keep_images: bool = False
+) -> Any:
     """Remove image/document blocks that DeepSeek cannot process.
 
     Claude Code sends PDFs as ``document`` blocks alongside a Read ``tool_result``
     that already contains the extracted text. Stripping preserves the request
     instead of failing with an unsupported block error.
+
+    With ``keep_images`` (vision-capable model), top-level images are kept and
+    images nested in a ``tool_result`` (e.g. Claude Code's Read of a PNG) are
+    hoisted to the end of the same user message, because DeepSeek requires
+    ``tool_result.content`` to be a string.
     """
     if not isinstance(messages, list):
         return messages
 
+    strippable = (
+        _STRIPPABLE_MESSAGE_BLOCK_TYPES - {"image"}
+        if keep_images
+        else _STRIPPABLE_MESSAGE_BLOCK_TYPES
+    )
     stripped: list[Any] = []
     top_level_dropped: dict[str, int] = {}
     nested_dropped: dict[str, int] = {}
     placeholder_replacements = 0
+    hoisted_images = 0
 
     for message in messages:
         if not isinstance(message, dict):
@@ -59,11 +84,12 @@ def _strip_unsupported_attachment_blocks(messages: Any) -> Any:
             continue
 
         new_content: list[Any] = []
+        hoisted: list[Any] = []
         message_dropped_attachment = False
         for block in content:
             if isinstance(block, dict):
                 btype = block.get("type")
-                if btype in _STRIPPABLE_MESSAGE_BLOCK_TYPES:
+                if btype in strippable:
                     top_level_dropped[btype] = top_level_dropped.get(btype, 0) + 1
                     message_dropped_attachment = True
                     continue
@@ -71,18 +97,24 @@ def _strip_unsupported_attachment_blocks(messages: Any) -> Any:
                     inner = block.get("content")
                     if isinstance(inner, list):
                         filtered_inner: list[Any] = []
+                        hoisted_before = len(hoisted)
                         for sub in inner:
-                            if (
-                                isinstance(sub, dict)
-                                and sub.get("type") in _STRIPPABLE_MESSAGE_BLOCK_TYPES
-                            ):
-                                sub_type = sub["type"]
+                            if not isinstance(sub, dict):
+                                filtered_inner.append(sub)
+                                continue
+                            sub_type = sub.get("type")
+                            if keep_images and sub_type == "image":
+                                hoisted.append(sub)
+                                continue
+                            if sub_type in _STRIPPABLE_MESSAGE_BLOCK_TYPES:
                                 nested_dropped[sub_type] = (
                                     nested_dropped.get(sub_type, 0) + 1
                                 )
                                 continue
                             filtered_inner.append(sub)
-                        if not filtered_inner:
+                        if len(hoisted) > hoisted_before and not filtered_inner:
+                            filtered_inner = [_HOISTED_IMAGE_BLOCK]
+                        elif not filtered_inner:
                             filtered_inner = [_OMITTED_ATTACHMENT_BLOCK]
                             placeholder_replacements += 1
                         new_block = dict(block)
@@ -90,6 +122,9 @@ def _strip_unsupported_attachment_blocks(messages: Any) -> Any:
                         new_content.append(new_block)
                         continue
             new_content.append(block)
+        # Anthropic requires tool_result blocks first; images go after them.
+        new_content.extend(hoisted)
+        hoisted_images += len(hoisted)
         if not new_content and message_dropped_attachment:
             new_content = [_OMITTED_ATTACHMENT_BLOCK]
             placeholder_replacements += 1
@@ -97,11 +132,17 @@ def _strip_unsupported_attachment_blocks(messages: Any) -> Any:
         new_msg["content"] = new_content
         stripped.append(new_msg)
 
+    if hoisted_images:
+        logger.info(
+            "DEEPSEEK_REQUEST: hoisted {} image block(s) out of tool_result "
+            "for vision-capable model",
+            hoisted_images,
+        )
     if top_level_dropped or nested_dropped:
         logger.warning(
             "DEEPSEEK_REQUEST: stripped unsupported attachment blocks "
             "(top_level={} nested_in_tool_result={} placeholder_tool_results={}). "
-            "DeepSeek has no vision/document support; the model will not see this content.",
+            "This DeepSeek model cannot read them; the model will not see this content.",
             dict(top_level_dropped),
             dict(nested_dropped),
             placeholder_replacements,
@@ -120,24 +161,32 @@ def _is_server_listed_tool(tool: Mapping[str, Any]) -> bool:
     return False
 
 
-def _walk_block_list_for_unsupported(blocks: Any, *, where: str) -> None:
+def _walk_block_list_for_unsupported(
+    blocks: Any, *, where: str, allow_images: bool = False
+) -> None:
     if not isinstance(blocks, list):
         return
     for block in blocks:
         if not isinstance(block, dict):
             continue
         btype = block.get("type")
+        if btype == "image" and allow_images:
+            continue
         if btype in _UNSUPPORTED_MESSAGE_BLOCK_TYPES:
             raise InvalidRequestError(
                 f"DeepSeek native does not support {btype!r} blocks ({where})."
             )
         if btype == "tool_result" and "content" in block:
             _walk_block_list_for_unsupported(
-                block["content"], where=f"{where} (tool_result content)"
+                block["content"],
+                where=f"{where} (tool_result content)",
+                allow_images=allow_images,
             )
 
 
-def _validate_deepseek_native_request_dict(data: dict[str, Any]) -> None:
+def _validate_deepseek_native_request_dict(
+    data: dict[str, Any], *, allow_images: bool = False
+) -> None:
     mcp = data.get("mcp_servers")
     if mcp:
         raise InvalidRequestError(
@@ -158,7 +207,9 @@ def _validate_deepseek_native_request_dict(data: dict[str, Any]) -> None:
             continue
         c = message.get("content")
         if isinstance(c, list):
-            _walk_block_list_for_unsupported(c, where=f"messages[{i}].content")
+            _walk_block_list_for_unsupported(
+                c, where=f"messages[{i}].content", allow_images=allow_images
+            )
         if isinstance(c, str) and "<think>" in c:
             # Unusual, but block encoded redacted content — treat as unsafe for DeepSeek.
             pass
@@ -386,9 +437,7 @@ def _strip_reasoning_content_when_native(messages: Any) -> Any:
 # Placeholder used when a tool call's real result was trimmed from context before
 # the request reached the proxy. Satisfies the Anthropic/DeepSeek pairing contract
 # without fabricating a substantive answer.
-_TRIMMED_TOOL_RESULT_TEXT = (
-    "[tool result omitted: trimmed from conversation context before reaching the provider]"
-)
+_TRIMMED_TOOL_RESULT_TEXT = "[tool result omitted: trimmed from conversation context before reaching the provider]"
 
 
 def _assistant_tool_use_ids(message: Any) -> list[str]:
@@ -601,9 +650,12 @@ def build_request_body(request_data: Any, *, thinking_enabled: bool) -> dict:
     )
 
     data = dump_raw_messages_request(request_data)
+    keep_images = _model_supports_images(data.get("model"))
     if "messages" in data:
-        data["messages"] = _strip_unsupported_attachment_blocks(data["messages"])
-    _validate_deepseek_native_request_dict(data)
+        data["messages"] = _strip_unsupported_attachment_blocks(
+            data["messages"], keep_images=keep_images
+        )
+    _validate_deepseek_native_request_dict(data, allow_images=keep_images)
     data.pop("extra_body", None)
 
     has_tool_history = _has_tool_history(data)

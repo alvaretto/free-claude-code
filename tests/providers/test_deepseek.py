@@ -1164,7 +1164,12 @@ def test_orphan_tool_use_gets_placeholder_tool_result(deepseek_provider):
                     "role": "assistant",
                     "content": [
                         {"type": "text", "text": "calc"},
-                        {"type": "tool_use", "id": "toolu_z", "name": "calc", "input": {}},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_z",
+                            "name": "calc",
+                            "input": {},
+                        },
                     ],
                 },
                 {"role": "user", "content": "sigue"},
@@ -1196,7 +1201,12 @@ def test_orphan_tool_use_trailing_inserts_user_message(deepseek_provider):
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "tool_use", "id": "toolu_a", "name": "calc", "input": {}},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_a",
+                            "name": "calc",
+                            "input": {},
+                        },
                     ],
                 },
             ],
@@ -1221,7 +1231,11 @@ def test_orphan_tool_result_reframed_as_text(deepseek_provider):
                 {
                     "role": "user",
                     "content": [
-                        {"type": "tool_result", "tool_use_id": "toolu_zzz", "content": "42"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_zzz",
+                            "content": "42",
+                        },
                         {"type": "text", "text": "y esto"},
                     ],
                 },
@@ -1231,8 +1245,7 @@ def test_orphan_tool_result_reframed_as_text(deepseek_provider):
     body = deepseek_provider._build_request_body(request)
     last = body["messages"][-1]
     assert not any(
-        isinstance(b, dict) and b.get("type") == "tool_result"
-        for b in last["content"]
+        isinstance(b, dict) and b.get("type") == "tool_result" for b in last["content"]
     )
     # The orphan result's payload survives as a text block.
     assert any(
@@ -1280,13 +1293,22 @@ def test_well_paired_tools_are_unchanged(deepseek_provider):
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "tool_use", "id": "toolu_ok", "name": "calc", "input": {}},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_ok",
+                            "name": "calc",
+                            "input": {},
+                        },
                     ],
                 },
                 {
                     "role": "user",
                     "content": [
-                        {"type": "tool_result", "tool_use_id": "toolu_ok", "content": "7"},
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_ok",
+                            "content": "7",
+                        },
                     ],
                 },
             ],
@@ -1294,7 +1316,8 @@ def test_well_paired_tools_are_unchanged(deepseek_provider):
     )
     body = deepseek_provider._build_request_body(request)
     assert _roles_and_blocks(body) == [
-        ("user", "str") if isinstance(body["messages"][0]["content"], str)
+        ("user", "str")
+        if isinstance(body["messages"][0]["content"], str)
         else ("user", ["text"]),
         ("assistant", ["tool_use"]),
         ("user", ["tool_result"]),
@@ -1312,7 +1335,12 @@ def test_reconcile_logs_warning_when_repairing(deepseek_provider, caplog):
                 {
                     "role": "assistant",
                     "content": [
-                        {"type": "tool_use", "id": "toolu_w", "name": "calc", "input": {}},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_w",
+                            "name": "calc",
+                            "input": {},
+                        },
                     ],
                 },
                 {"role": "user", "content": "sigue"},
@@ -1326,3 +1354,171 @@ def test_reconcile_logs_warning_when_repairing(deepseek_provider, caplog):
         for r in caplog.records
         if r.levelno == logging.WARNING
     )
+
+
+_PNG_SOURCE = {"type": "base64", "media_type": "image/png", "data": "abc"}
+_PDF_SOURCE = {"type": "base64", "media_type": "application/pdf", "data": "pdf"}
+
+
+def _read_tool_exchange(model: str, tool_results: list[dict]) -> MessagesRequest:
+    """Assistant Read tool_use(s) answered by the given tool_result blocks."""
+    return MessagesRequest.model_validate(
+        {
+            "model": model,
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tr["tool_use_id"],
+                            "name": "Read",
+                            "input": {"path": "f"},
+                        }
+                        for tr in tool_results
+                    ],
+                },
+                {"role": "user", "content": tool_results},
+            ],
+        }
+    )
+
+
+def test_vision_model_keeps_top_level_image(deepseek_provider):
+    """deepseek-v4-flash accepts images, so they are forwarded untouched."""
+    request = MessagesRequest.model_validate(
+        {
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this"},
+                        {"type": "image", "source": _PNG_SOURCE},
+                    ],
+                }
+            ],
+        }
+    )
+
+    body = deepseek_provider._build_request_body(request)
+
+    content = body["messages"][0]["content"]
+    assert [b["type"] for b in content] == ["text", "image"]
+    assert content[1]["source"]["data"] == "abc"
+
+
+def test_non_vision_deepseek_model_still_strips_image(deepseek_provider):
+    """deepseek-v4-pro cannot see images: they are still stripped."""
+    request = MessagesRequest.model_validate(
+        {
+            "model": "deepseek-v4-pro",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this"},
+                        {"type": "image", "source": _PNG_SOURCE},
+                    ],
+                }
+            ],
+        }
+    )
+
+    body = deepseek_provider._build_request_body(request)
+
+    assert "image" not in [b["type"] for b in body["messages"][0]["content"]]
+
+
+def test_vision_model_hoists_image_out_of_tool_result(deepseek_provider):
+    """Read of a PNG: the image moves after the tool_result, which stays a string."""
+    request = _read_tool_exchange(
+        "deepseek-v4-flash",
+        [
+            {
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": [{"type": "image", "source": _PNG_SOURCE}],
+            }
+        ],
+    )
+
+    body = deepseek_provider._build_request_body(request)
+
+    content = body["messages"][1]["content"]
+    assert [b["type"] for b in content] == ["tool_result", "image"]
+    assert isinstance(content[0]["content"], str)
+    assert "image attached after this tool result" in content[0]["content"]
+    assert "abc" not in content[0]["content"]
+    assert content[1]["source"]["data"] == "abc"
+
+
+def test_vision_model_keeps_tool_result_text_when_hoisting(deepseek_provider):
+    request = _read_tool_exchange(
+        "deepseek-v4-flash",
+        [
+            {
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": [
+                    {"type": "text", "text": "screenshot saved"},
+                    {"type": "image", "source": _PNG_SOURCE},
+                ],
+            }
+        ],
+    )
+
+    body = deepseek_provider._build_request_body(request)
+
+    content = body["messages"][1]["content"]
+    assert [b["type"] for b in content] == ["tool_result", "image"]
+    assert content[0]["content"] == "screenshot saved"
+
+
+def test_vision_model_still_strips_documents(deepseek_provider):
+    """No DeepSeek model reads PDFs, even the vision-capable one."""
+    request = MessagesRequest.model_validate(
+        {
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "summarize"},
+                        {"type": "document", "source": _PDF_SOURCE},
+                    ],
+                }
+            ],
+        }
+    )
+
+    body = deepseek_provider._build_request_body(request)
+
+    assert [b["type"] for b in body["messages"][0]["content"]] == ["text"]
+
+
+def test_hoist_placeholder_is_per_tool_result(deepseek_provider):
+    """A document-only tool_result gets the omitted placeholder, not the hoist note,
+    even when a sibling tool_result in the same message hoisted an image."""
+    request = _read_tool_exchange(
+        "deepseek-v4-flash",
+        [
+            {
+                "type": "tool_result",
+                "tool_use_id": "t1",
+                "content": [{"type": "image", "source": _PNG_SOURCE}],
+            },
+            {
+                "type": "tool_result",
+                "tool_use_id": "t2",
+                "content": [{"type": "document", "source": _PDF_SOURCE}],
+            },
+        ],
+    )
+
+    body = deepseek_provider._build_request_body(request)
+
+    content = body["messages"][1]["content"]
+    assert [b["type"] for b in content] == ["tool_result", "tool_result", "image"]
+    assert "image attached after this tool result" in content[0]["content"]
+    assert "attachment omitted" in content[1]["content"]
